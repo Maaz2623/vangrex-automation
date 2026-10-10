@@ -16,10 +16,12 @@
   },
   "dependencies": {
     "@ai-sdk/google": "^4.0.93",
+    "@mediar-ai/terminator": "^0.24.32",
     "ai": "^7.0.137",
     "dotenv": "^18.0.7",
     "grammy": "^1.46.0",
     "marked": "^18.1.0",
+    "terminator": "^0.0.1",
     "zod": "^4.6.5"
   }
 }

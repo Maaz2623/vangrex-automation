@@ -1,8 +1,11 @@
 import { google } from "@ai-sdk/google";
-import { generateText, streamText, type ModelMessage } from "ai";
+import { generateText, isStepCount, streamText, type ModelMessage } from "ai";
 import "dotenv/config";
 import { Bot } from "grammy";
 import { INSTRUCTIONS } from "./instructions";
+import { shortcutTool } from "./tools/shortcut.tool";
+import { getCurrentFocusedApplication } from "./tools/get-current-focused-application.tool";
+import { openApplicationTool } from "./tools/open-application.tool";
 
 const botToken = process.env.TELEGRAM_BOT_TOKEN!;
 
@@ -51,6 +54,12 @@ bot.on("message:text", async (ctx) => {
       model: google("gemini-3.5-flash-lite"),
       instructions: INSTRUCTIONS,
       messages,
+      tools: {
+        executeShortcuts: shortcutTool,
+        getCurrentFocusedApplication,
+        openApplication: openApplicationTool,
+      },
+      stopWhen: isStepCount(5),
     });
 
     messages.push({
