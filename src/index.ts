@@ -1,7 +1,8 @@
 import { google } from "@ai-sdk/google";
-import { streamText, type ModelMessage } from "ai";
+import { generateText, streamText, type ModelMessage } from "ai";
 import "dotenv/config";
 import { Bot } from "grammy";
+import { INSTRUCTIONS } from "./instructions";
 
 const botToken = process.env.TELEGRAM_BOT_TOKEN!;
 
@@ -46,34 +47,20 @@ bot.on("message:text", async (ctx) => {
   await ctx.api.sendChatAction(chatId, "typing");
 
   try {
-    const result = streamText({
+    const result = await generateText({
       model: google("gemini-3.5-flash-lite"),
-
+      instructions: INSTRUCTIONS,
       messages,
     });
 
-    let fullResponse = "";
-
-    for await (const delta of result.textStream) {
-      fullResponse += delta;
-    }
-
-    if (!fullResponse.trim()) {
-      await ctx.reply("I couldn't generate a response. Please try again.");
-      return;
-    }
-
     messages.push({
       role: "assistant",
-      content: fullResponse,
+      content: result.text,
     });
 
-    // Telegram messages have a 4096-character limit.
-    const chunks = fullResponse.match(/[\s\S]{1,4000}/g) ?? [];
-
-    for (const chunk of chunks) {
-      await ctx.reply(chunk);
-    }
+    await ctx.reply(result.text, {
+      parse_mode: "Markdown",
+    });
   } catch (error) {
     // Remove the failed user message so history stays consistent.
     messages.pop();
