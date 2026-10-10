@@ -19,7 +19,7 @@ export const getAllRunningApplicatoins = async () => {
 
 const getApplication = async (name: string) => {
   const application = desktop.application(name);
-  application.activateWindow();
+  application.focus();
   const tree = desktop.getWindowTreeResult(name, undefined, {
     formatOutput: true,
     treeOutputFormat: Terminator.TreeOutputFormat.CompactYaml,

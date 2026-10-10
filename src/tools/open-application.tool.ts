@@ -19,7 +19,9 @@ export const openApplicationTool = tool({
 
   execute: async ({ name }) => {
     try {
-      const application = await desktop.openApplication(name);
+      const application = desktop.openApplication(name);
+
+      desktop.activateApplication(name);
 
       return {
         success: true,
