@@ -4,13 +4,6 @@ import "dotenv/config";
 import { Bot } from "grammy";
 
 import { INSTRUCTIONS } from "./instructions";
-import { shortcutTool } from "./tools/shortcut.tool";
-import { getCurrentFocusedApplication } from "./tools/get-current-focused-application.tool";
-import { openApplicationTool } from "./tools/open-application.tool";
-import { getCurrentlyRunningApplicationsTool } from "./tools/get-currently-running-applications.tool";
-import { focusApplicationTool } from "./tools/focus-application.tool";
-import { desktopAgentTool } from "./agents/desktop-agent";
-
 // --------------------------------------------------
 // Configuration
 // --------------------------------------------------
@@ -31,11 +24,11 @@ const conversations = new Map<number, ModelMessage[]>();
 
 async function runAssistant(messages: ModelMessage[]) {
   return generateText({
-    model: google("gemini-3.5-flash-lite"),
+    model: google("gemini-flash-lite-latest"),
     instructions: "Use the agents you have to complete user's request.",
     messages,
     tools: {
-      desktopAutomation: desktopAgentTool,
+      // search: toolSearch(),
     },
     stopWhen: isStepCount(5),
   });
@@ -138,6 +131,8 @@ bot.catch((error) => {
 // Start bot
 // --------------------------------------------------
 
-bot.start();
+bot.start({
+  drop_pending_updates: true,
+});
 
 console.log("Telegram Gemini bot is running...");
