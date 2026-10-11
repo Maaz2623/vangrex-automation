@@ -28,6 +28,8 @@ export const desktopAgentTool = tool({
     task: z.string().describe("The task to perform on the desktop"),
   }),
   execute: async ({ task }, { abortSignal }) => {
+
+    
     const result = await desktopAgent.generate({
       prompt: task,
       abortSignal,
