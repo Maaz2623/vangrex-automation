@@ -1,3 +1,4 @@
+
 import "dotenv/config";
 
 import { Desktop } from "@mediar-ai/terminator";
@@ -29,7 +30,6 @@ const MODEL = "gemini-3.5-flash-lite";
 const MAX_STEPS = 20;
 const MAX_TOTAL_INSPECTIONS = 12;
 const MAX_CONSECUTIVE_INSPECTIONS = 3;
-
 const MAX_DIFF_LINES = 60;
 
 const TREE_OPTIONS = {
@@ -66,11 +66,10 @@ type ParsedElement = {
 // STATE
 // ============================================================
 
-// Full tree stays in local memory for element lookup.
-// It is not repeatedly sent to the model.
+// Full current tree is retained locally for reliable element lookup.
 let latestFormattedTree = "";
 
-// Keep the previous snapshot even when the tree cache is invalidated.
+// Preserve snapshots across actions so diffs compare consecutive states.
 let latestSnapshot: TreeSnapshot | undefined;
 
 let totalInspections = 0;
@@ -84,8 +83,7 @@ let treeIsCurrent = false;
 // ============================================================
 
 function invalidateTree(): void {
-  // Invalidate the cached text but preserve latestSnapshot.
-  // The snapshot is required to compare the next UI state.
+  // Preserve latestSnapshot for the next diff.
   treeIsCurrent = false;
   latestFormattedTree = "";
 }
@@ -192,11 +190,9 @@ function findElement(requestedName: string): ParsedElement | undefined {
 }
 
 // ============================================================
-// TEXT-BASED TREE DIFF
+// TREE DIFF
 // ============================================================
 
-// Produces concrete added/removed tree lines in addition to the
-// structured snapshot diff. The full tree remains private in memory.
 function getTreeLineDiff(oldTree: string, newTree: string): string {
   const oldLines = oldTree
     .split(/\r?\n/)
@@ -214,38 +210,102 @@ function getTreeLineDiff(oldTree: string, newTree: string): string {
   const removed = oldLines.filter((line) => !newSet.has(line));
   const added = newLines.filter((line) => !oldSet.has(line));
 
-  if (removed.length === 0 && added.length === 0) {
+  if (!removed.length && !added.length) {
     return "No textual tree changes detected.";
   }
 
-  const limitedRemoved = removed.slice(0, MAX_DIFF_LINES);
-  const limitedAdded = added.slice(0, MAX_DIFF_LINES);
-
   const sections: string[] = [];
 
-  if (added.length > 0) {
+  if (added.length) {
     sections.push(
       `ADDED OR CHANGED LINES (${added.length}):\n` +
-        limitedAdded.map((line) => `+ ${line}`).join("\n"),
+        added
+          .slice(0, MAX_DIFF_LINES)
+          .map((line) => `+ ${line}`)
+          .join("\n"),
     );
   }
 
-  if (removed.length > 0) {
+  if (removed.length) {
     sections.push(
       `REMOVED OR CHANGED LINES (${removed.length}):\n` +
-        limitedRemoved.map((line) => `- ${line}`).join("\n"),
+        removed
+          .slice(0, MAX_DIFF_LINES)
+          .map((line) => `- ${line}`)
+          .join("\n"),
     );
   }
 
   const omitted =
-    Math.max(0, added.length - limitedAdded.length) +
-    Math.max(0, removed.length - limitedRemoved.length);
+    Math.max(0, added.length - MAX_DIFF_LINES) +
+    Math.max(0, removed.length - MAX_DIFF_LINES);
 
   if (omitted > 0) {
     sections.push(`${omitted} additional changed lines omitted.`);
   }
 
   return sections.join("\n\n");
+}
+
+// ============================================================
+// DYNAMIC TREE RETRIEVAL
+// ============================================================
+
+async function getDynamicWindowTree(
+  processName: string,
+): Promise<string> {
+  const errors: string[] = [];
+
+  // Try the primary API first.
+  try {
+    const result = await desktop.getWindowTreeResult(
+      processName,
+      undefined,
+      TREE_OPTIONS,
+    );
+
+    if (
+      typeof result.formatted === "string" &&
+      result.formatted.trim()
+    ) {
+      return result.formatted;
+    }
+
+    errors.push("getWindowTreeResult returned no formatted text.");
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : String(error);
+
+    errors.push(`getWindowTreeResult: ${message}`);
+  }
+
+  // Try the async tree API if the primary method fails.
+  try {
+    const result = await desktop.getWindowTreeResultAsync(
+      processName,
+      undefined,
+      TREE_OPTIONS,
+    );
+
+    if (
+      typeof result.formatted === "string" &&
+      result.formatted.trim()
+    ) {
+      return result.formatted;
+    }
+
+    errors.push("getWindowTreeResultAsync returned no formatted text.");
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : String(error);
+
+    errors.push(`getWindowTreeResultAsync: ${message}`);
+  }
+
+  throw new Error(
+    `Could not retrieve the UI tree for process "${processName}".\n` +
+      errors.join("\n"),
+  );
 }
 
 // ============================================================
@@ -257,11 +317,11 @@ async function inspectCurrentApplication(
   forceRefresh = false,
 ): Promise<InspectionResult> {
   if (treeIsCurrent && !forceRefresh && latestFormattedTree) {
-    console.log("[Inspect] UI has not been invalidated; using cached state.");
+    console.log("[Inspect] Using cached UI state.");
 
     return {
       success: true,
-      changes: "No new tree read was needed; the cached UI state is current.",
+      changes: "Cached UI state; no new tree read was needed.",
       actionableElements: formatActionableElements(
         detectActionableElements(latestFormattedTree),
       ),
@@ -279,8 +339,7 @@ async function inspectCurrentApplication(
     return {
       success: false,
       error:
-        `Inspection limit reached (${MAX_CONSECUTIVE_INSPECTIONS} consecutive reads). ` +
-        "Choose an action using the latest available UI information.",
+        `Inspection limit reached (${MAX_CONSECUTIVE_INSPECTIONS} consecutive reads).`,
     };
   }
 
@@ -294,64 +353,45 @@ async function inspectCurrentApplication(
   );
 
   try {
+    // Resolve the currently focused application dynamically.
     const application = await desktop.getCurrentApplication();
-    const processName = await application.processName();
+    const processName = application.processName();
 
-    console.log("[Inspect] Current process:", processName);
+    console.log("[Inspect] Focused process:", processName);
 
     if (!processName) {
       return {
         success: false,
-        error: "Could not determine the focused application's process.",
+        error: "The focused application returned no process name.",
       };
     }
 
-    const result = await desktop.getWindowTreeResult(
-      processName,
-      undefined,
-      TREE_OPTIONS,
-    );
+    // Try tree retrieval without hard-coded app names or titles.
+    const formattedTree = await getDynamicWindowTree(processName);
 
-    const formattedTree =
-      typeof result.formatted === "string" ? result.formatted : "";
+    console.log("[Inspect] Formatted tree length:", formattedTree.length);
 
-    console.log("[Inspect Debug] Formatted type:", typeof result.formatted);
-    console.log("[Inspect Debug] Formatted length:", formattedTree.length);
-
-    if (!formattedTree.trim()) {
-      treeIsCurrent = false;
-
-      return {
-        success: false,
-        error: "The UI tree returned no formatted text.",
-      };
-    }
-
-    // Capture the old state BEFORE replacing it.
     const oldTree = latestFormattedTree;
     const oldSnapshot = latestSnapshot;
-
-    // Build the new state.
     const newSnapshot = createSnapshot(formattedTree);
 
     let changeSummary: string;
     let lineDiff: string;
 
-    if (oldSnapshot && oldTree) {
-      const snapshotDiff = diffSnapshots(oldSnapshot, newSnapshot);
+    if (oldTree && oldSnapshot) {
+      changeSummary = summarizeChanges(
+        diffSnapshots(oldSnapshot, newSnapshot),
+      );
 
-      changeSummary = summarizeChanges(snapshotDiff);
       lineDiff = getTreeLineDiff(oldTree, formattedTree);
 
-      console.log("[Inspect] Compared new snapshot with previous snapshot.");
+      console.log("[Inspect] Compared current UI with previous snapshot.");
     } else {
-      changeSummary = "Initial snapshot: no previous UI state to compare.";
-      lineDiff = "Initial inspection; the complete tree is provided once.";
-
-      console.log("[Inspect] Captured initial snapshot.");
+      changeSummary = "Initial snapshot; no prior UI state exists.";
+      lineDiff = "Initial inspection.";
     }
 
-    // Save the latest state for future comparisons and click lookups.
+    // Store the new state only after successful tree retrieval.
     latestSnapshot = newSnapshot;
     latestFormattedTree = formattedTree;
     treeIsCurrent = true;
@@ -362,8 +402,8 @@ async function inspectCurrentApplication(
 
     console.log("[Inspect] Tree captured successfully.");
 
-    // Only the first inspection returns the complete tree.
-    if (!oldSnapshot || !oldTree) {
+    // Full tree is returned to the model only for the first inspection.
+    if (!oldTree || !oldSnapshot) {
       return {
         success: true,
         initialTree: formattedTree,
@@ -372,7 +412,6 @@ async function inspectCurrentApplication(
       };
     }
 
-    // Subsequent inspections return a diff and current actionable elements.
     return {
       success: true,
       changes: `${changeSummary}\n\n${lineDiff}`,
@@ -381,7 +420,8 @@ async function inspectCurrentApplication(
   } catch (error) {
     treeIsCurrent = false;
 
-    const message = error instanceof Error ? error.message : String(error);
+    const message =
+      error instanceof Error ? error.message : String(error);
 
     console.error("[Inspect] Failed:", message);
 
@@ -421,8 +461,7 @@ async function clickElement(
       success: false,
       error:
         `No unique element named "${elementName}" with usable bounds ` +
-        "was found in the latest UI tree. Inspect the latest changes and " +
-        "actionable elements, then select an exact accessible name.",
+        "was found in the latest tree.",
       actionableElements: latestFormattedTree
         ? formatActionableElements(
             detectActionableElements(latestFormattedTree),
@@ -431,7 +470,10 @@ async function clickElement(
     };
   }
 
-  console.log(`[Click] "${element.name}" (${element.role})`, element.bounds);
+  console.log(
+    `[Click] "${element.name}" (${element.role})`,
+    element.bounds,
+  );
 
   try {
     const { x, y, width, height } = element.bounds;
@@ -442,37 +484,38 @@ async function clickElement(
     resetInspectionGuard();
     invalidateTree();
 
-    console.log("[Click] Click call completed.");
-
     return {
       success: true,
       clickedElement: element.name,
       role: element.role,
       verified: false,
-      message: "Click completed. Inspect the UI to see what changed.",
+      message: "Click completed. Inspect the updated UI to verify.",
     };
   } catch (error) {
     return {
       success: false,
-      element: element.name,
       error: error instanceof Error ? error.message : String(error),
     };
   }
 }
 
 // ============================================================
-// TYPE TEXT — NO KEYBOARD SHORTCUTS
+// TYPE TEXT — LITERAL TEXT ONLY
 // ============================================================
 
-async function typeText(textToType: string): Promise<Record<string, unknown>> {
+async function typeText(
+  textToType: string,
+): Promise<Record<string, unknown>> {
   if (!textToType.length) {
-    return { success: false, error: "No text was supplied." };
+    return {
+      success: false,
+      error: "No text was supplied.",
+    };
   }
 
   try {
     const application = await desktop.getCurrentApplication();
 
-    // The intended input must already be focused by a mouse click.
     await application.typeText(textToType, {
       clearBeforeTyping: true,
       includeWindowScreenshot: false,
@@ -488,7 +531,7 @@ async function typeText(textToType: string): Promise<Record<string, unknown>> {
       success: true,
       characterCount: textToType.length,
       verified: false,
-      message: "Text entry completed. Inspect the UI to see what changed.",
+      message: "Text entry completed. Inspect the updated UI to verify.",
     };
   } catch (error) {
     return {
@@ -505,10 +548,9 @@ async function typeText(textToType: string): Promise<Record<string, unknown>> {
 const terminatorTools = {
   inspectUI: tool({
     description:
-      "Refresh and inspect the current application's UI. The initial " +
-      "inspection returns the full tree. Later inspections return only " +
-      "the UI diff, added/removed tree lines, and current actionable " +
-      "elements. Use those changes to decide the next action.",
+      "Inspect the focused application. The first inspection returns " +
+      "the full tree; later inspections return only diffs and actionable " +
+      "elements. Use changes to decide the next action.",
 
     inputSchema: z.object({
       reason: z.string(),
@@ -521,8 +563,8 @@ const terminatorTools = {
 
   clickElement: tool({
     description:
-      "Click an element by its exact accessible name from the latest UI " +
-      "information. Uses mouse clicks only. Never invent element names.",
+      "Click an element using its exact accessible name from the latest " +
+      "UI information. Uses mouse clicks only.",
 
     inputSchema: z.object({
       elementName: z.string(),
@@ -536,7 +578,7 @@ const terminatorTools = {
   typeText: tool({
     description:
       "Type literal text into the currently focused input. Click the " +
-      "target field first. This tool does not perform keyboard shortcuts.",
+      "target field first. No keyboard shortcuts are available.",
 
     inputSchema: z.object({
       text: z.string(),
@@ -555,29 +597,25 @@ const terminatorTools = {
 const SYSTEM_PROMPT = `
 You are a desktop UI automation agent.
 
-INTERACTION RULES:
+INTERACTION:
 - Use mouse clicks and literal text entry only.
-- Never press keyboard keys or use keyboard shortcuts.
+- Never use keyboard keys or shortcuts.
 - Never invent element names or coordinates.
-- The click tool uses the latest UI tree held internally.
+- The click tool uses the latest tree retained internally.
 
-DIFF-DRIVEN INSPECTION:
+DIFF-DRIVEN REASONING:
 - The initial prompt contains the complete UI tree.
-- After an action, inspect the updated UI.
-- Subsequent inspections provide a diff, changed tree lines, and current
-  actionable elements instead of the full tree.
-- Compare these changes with the previous UI state to understand what
-  happened after your action.
-- Use the actionable elements to choose the next exact element name.
-- Do not request repeated inspections of an unchanged UI.
-- If inspection fails, use its error and do not retry blindly.
-- Do not assume a click succeeded merely because the tool call completed.
+- After actions, inspect the updated UI.
+- Later inspections provide diffs and actionable elements.
+- Reason about what changed before choosing the next action.
+- Do not repeatedly inspect an unchanged UI.
+- If inspection fails, read the error and do not retry blindly.
 
-TASK COMPLETION:
-- Verify important actions by inspecting the resulting UI.
-- Do not claim an extension was installed unless the UI confirms it.
-- If a required operation cannot be completed using clicks and text entry,
-  explain the limitation honestly.
+TASK:
+- Perform the user's requested task using the available tools.
+- Verify the result by inspecting the UI.
+- Never claim success without evidence from the resulting UI.
+- If the required action cannot be performed, explain the limitation.
 `;
 
 // ============================================================
@@ -604,6 +642,7 @@ async function main(): Promise<void> {
   console.log("Model:", MODEL);
   console.log("Interaction methods: mouse clicks + text entry only.");
   console.log("UI context: initial tree, then diffs + actionable elements.");
+  console.log("Application discovery: dynamic; no app names hard-coded.");
 
   const initialInspection = await inspectCurrentApplication(
     "Initial inspection before executing the task",
@@ -615,6 +654,7 @@ async function main(): Promise<void> {
       "\nCould not inspect the initial application:",
       initialInspection.error,
     );
+
     process.exitCode = 1;
     return;
   }
@@ -629,9 +669,8 @@ ${initialInspection.actionableElements ?? "None identified."}
 TASK:
 ${task}
 
-The initial tree is your baseline. After each action, inspect the UI and
-reason from the returned changes and actionable elements. Do not expect
-the full tree to be repeated.
+Use the initial tree as your baseline. After each action, inspect the UI
+and reason from the returned changes and actionable elements.
 `;
 
   try {
