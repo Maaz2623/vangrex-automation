@@ -1,323 +1,663 @@
 import "dotenv/config";
 
+import { Desktop } from "@mediar-ai/terminator";
+import * as Terminator from "@mediar-ai/terminator";
 import { google } from "@ai-sdk/google";
 import { generateText, stepCountIs, tool } from "ai";
 import { z } from "zod";
 
-import Terminator, { desktop } from "./src/desktop";
 import {
   createSnapshot,
   diffSnapshots,
   summarizeChanges,
+  type TreeSnapshot,
 } from "./tree-tracker";
+
 import {
   detectActionableElements,
   formatActionableElements,
 } from "./actionable-elements";
 
-const MODEL = "gemini-3.5-flash-lite";
-const PROCESS_NAME = "notepad";
-const MAIN_WINDOW_TITLE = "*Vangrex AI Desktop Automation.txt - Notepad";
+// ============================================================
+// CONFIGURATION
+// ============================================================
 
-const actionOptions = {
-  clearBeforeTyping: true,
+const desktop = new Desktop();
+
+const MODEL = "gemini-3.5-flash-lite";
+
+const MAX_STEPS = 20;
+const MAX_TOTAL_INSPECTIONS = 12;
+const MAX_CONSECUTIVE_INSPECTIONS = 3;
+
+const MAX_DIFF_LINES = 60;
+
+const TREE_OPTIONS = {
+  formatOutput: true,
+  propertyMode: Terminator.PropertyLoadingMode.Complete,
+  treeOutputFormat: Terminator.TreeOutputFormat.CompactYaml,
   includeWindowScreenshot: false,
+  includeMonitorScreenshots: false,
 };
 
-type UIInspection = Awaited<ReturnType<typeof inspectWindow>>;
+type Bounds = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+type InspectionResult = {
+  success: boolean;
+  initialTree?: string;
+  actionableElements?: string;
+  changes?: string;
+  error?: string;
+};
+
+type ParsedElement = {
+  name: string;
+  role: string;
+  bounds: Bounds;
+  line: string;
+};
+
+// ============================================================
+// STATE
+// ============================================================
+
+// Full tree stays in local memory for element lookup.
+// It is not repeatedly sent to the model.
+let latestFormattedTree = "";
+
+// Keep the previous snapshot even when the tree cache is invalidated.
+let latestSnapshot: TreeSnapshot | undefined;
+
+let totalInspections = 0;
+let consecutiveInspections = 0;
+let successfulActions = 0;
+
+let treeIsCurrent = false;
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function invalidateTree(): void {
+  // Invalidate the cached text but preserve latestSnapshot.
+  // The snapshot is required to compare the next UI state.
+  treeIsCurrent = false;
+  latestFormattedTree = "";
 }
 
-async function inspectWindow(windowTitle: string) {
-  const result = await desktop.getWindowTreeResult(PROCESS_NAME, windowTitle, {
-    formatOutput: true,
-    propertyMode: Terminator.PropertyLoadingMode.Complete,
-    treeOutputFormat: Terminator.TreeOutputFormat.CompactYaml,
-  });
+function resetInspectionGuard(): void {
+  consecutiveInspections = 0;
+}
 
-  const tree = result.formatted;
+function normalizeText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
 
-  if (!tree?.trim()) {
-    throw new Error(`The UI tree was empty for "${windowTitle}".`);
+function parseBounds(line: string): Bounds | undefined {
+  const match = line.match(
+    /bounds:\s*\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]/i,
+  );
+
+  if (!match) return undefined;
+
+  const [, x, y, width, height] = match;
+
+  const bounds = {
+    x: Number(x),
+    y: Number(y),
+    width: Number(width),
+    height: Number(height),
+  };
+
+  if (
+    !Number.isFinite(bounds.x) ||
+    !Number.isFinite(bounds.y) ||
+    bounds.width <= 0 ||
+    bounds.height <= 0
+  ) {
+    return undefined;
   }
 
-  const snapshot = createSnapshot(tree);
-  const actionableElements = detectActionableElements(tree);
-
-  return {
-    tree,
-    snapshot,
-    actionableElements,
-    actionableSummary: formatActionableElements(actionableElements),
-    nodeLineCount: tree.split("\n").filter(Boolean).length,
-    editorFound: tree.includes("[Document]"),
-  };
+  return bounds;
 }
 
-function compactInspection(ui: UIInspection) {
-  return {
-    controls: ui.actionableSummary,
-    editorFound: ui.editorFound,
-    nodeLineCount: ui.nodeLineCount,
-  };
+function parseElementLine(line: string): ParsedElement | undefined {
+  const roleMatch = line.match(/\[[^\]]+\]/);
+  if (!roleMatch) return undefined;
+
+  const bounds = parseBounds(line);
+  if (!bounds) return undefined;
+
+  const role = roleMatch[0].slice(1, -1);
+
+  const name = line
+    .slice((roleMatch.index ?? 0) + roleMatch[0].length)
+    .replace(/\(bounds:.*$/i, "")
+    .replace(/,\s*(focused|focusable|offscreen|disabled)\b/gi, "")
+    .trim()
+    .replace(/^["']|["']$/g, "");
+
+  return { name, role, bounds, line };
 }
 
-const inspectUITool = tool({
-  description: `
-Inspect the current Notepad window and its accessible controls.
-Use the exact accessible role and name returned here.
-After a Save As dialog opens, inspect using windowTitle "Save As".
-Never assume a dialog or menu opened without inspecting it.
-`,
-  inputSchema: z.object({
-    windowTitle: z.string().optional(),
-  }),
-  execute: async ({ windowTitle }) => {
-    try {
-      const ui = await inspectWindow(windowTitle ?? MAIN_WINDOW_TITLE);
+function findElement(requestedName: string): ParsedElement | undefined {
+  if (!latestFormattedTree) return undefined;
 
-      return {
-        success: true,
-        windowTitle: windowTitle ?? MAIN_WINDOW_TITLE,
-        ...compactInspection(ui),
-      };
-    } catch (error) {
-      return {
-        success: false,
-        error: errorMessage(error),
-      };
-    }
-  },
-});
+  const requested = normalizeText(requestedName);
+  if (!requested) return undefined;
 
-const clickElementTool = tool({
-  description: `
-Click one exact accessible control in Notepad.
-Always inspect before clicking and inspect again after clicking.
-Return the before/after UI diff.
-For the Save As dialog, pass windowTitle "Save As".
-After clicking Save in that dialog, inspect the main Notepad window.
-Never click a disabled control or blindly repeat a failed action.
-`,
-  inputSchema: z.object({
-    role: z.string().min(1),
-    name: z.string().min(1),
-    windowTitle: z.string().optional(),
-  }),
-  execute: async ({ role, name, windowTitle }) => {
-    const currentTitle = windowTitle ?? MAIN_WINDOW_TITLE;
+  const candidates = latestFormattedTree
+    .split(/\r?\n/)
+    .map(parseElementLine)
+    .filter((element): element is ParsedElement => Boolean(element));
 
-    try {
-      const before = await inspectWindow(currentTitle);
+  const exactMatches = candidates.filter(
+    (element) => normalizeText(element.name) === requested,
+  );
 
-      const match = before.actionableElements.find(
-        (element) => element.role === role && element.name === name,
-      );
+  if (exactMatches.length === 1) return exactMatches[0];
 
-      if (!match) {
-        return {
-          success: false,
-          message: `Control not found: [${role}] ${name}`,
-          availableControls: before.actionableSummary,
-        };
-      }
+  if (exactMatches.length > 1) {
+    console.log(`[Click] Multiple exact matches for "${requestedName}".`);
+    return undefined;
+  }
 
-      if (match.enabled === false) {
-        return {
-          success: false,
-          message: `Control is disabled: [${role}] ${name}`,
-        };
-      }
-
-      const selector = `process:${PROCESS_NAME} >> (role:${role} && name:${name})`;
-
-      const element = await desktop.locator(selector).first(5000);
-
-      await element.click(actionOptions);
-      await desktop.delay(400);
-
-      // Switch inspection targets when the Save As dialog opens/closes.
-      const lowerName = name.toLowerCase();
-
-      const nextTitle =
-        lowerName === "save as"
-          ? "Save As"
-          : currentTitle === "Save As" && lowerName === "save"
-            ? MAIN_WINDOW_TITLE
-            : currentTitle;
-
-      const after = await inspectWindow(nextTitle);
-      const diff = diffSnapshots(before.snapshot, after.snapshot);
-
-      return {
-        success: true,
-        action: "click",
-        clicked: { role, name },
-        inspectedWindowAfterAction: nextTitle,
-        changes: summarizeChanges(diff),
-        after: compactInspection(after),
-        nextStep: "Review the new UI state before taking another action.",
-      };
-    } catch (error) {
-      return {
-        success: false,
-        message: `Click failed: [${role}] ${name}`,
-        error: errorMessage(error),
-      };
-    }
-  },
-});
-
-const typeTextTool = tool({
-  description: `
-Type text into a specific accessible element.
-Inspect before typing and after typing, then return the UI diff.
-Use the exact role and name from inspectUI.
-For the Save As filename field, use its inspected role/name and
-windowTitle "Save As".
-clearBeforeTyping is enabled, so existing text in the target field
-will be replaced. Do not target the document unless intended.
-`,
-  inputSchema: z.object({
-    text: z.string().min(1),
-    role: z.string().min(1),
-    name: z.string().min(1),
-    windowTitle: z.string().optional(),
-  }),
-  execute: async ({ text, role, name, windowTitle }) => {
-    const currentTitle = windowTitle ?? MAIN_WINDOW_TITLE;
-
-    try {
-      const before = await inspectWindow(currentTitle);
-
-      const match = before.actionableElements.find(
-        (element) => element.role === role && element.name === name,
-      );
-
-      if (!match) {
-        return {
-          success: false,
-          message: `Typing target not found: [${role}] ${name}`,
-          availableControls: before.actionableSummary,
-        };
-      }
-
-      if (match.enabled === false) {
-        return {
-          success: false,
-          message: `Typing target is disabled: ${name}`,
-        };
-      }
-
-      const selector = `process:${PROCESS_NAME} >> (role:${role} && name:${name})`;
-
-      const element = await desktop.locator(selector).first(5000);
-
-      await element.click(actionOptions);
-      await element.typeText(text, actionOptions);
-      await desktop.delay(300);
-
-      const after = await inspectWindow(currentTitle);
-      const diff = diffSnapshots(before.snapshot, after.snapshot);
-
-      return {
-        success: true,
-        action: "typeText",
-        target: { role, name },
-        charactersRequested: text.length,
-        changes: summarizeChanges(diff),
-        after: compactInspection(after),
-        note: "Typing was accepted by the action API; the UI diff may not expose field contents.",
-      };
-    } catch (error) {
-      return {
-        success: false,
-        message: `Typing failed in [${role}] ${name}`,
-        error: errorMessage(error),
-      };
-    }
-  },
-});
-
-async function main() {
-  console.log("Launching Notepad...");
-
-  await desktop.openApplication("notepad.exe");
-  await desktop.delay(1500);
-
-  console.log("Starting desktop agent...");
-
-  const result = await generateText({
-    model: google(MODEL),
-
-    system: `
-You are a Windows desktop automation agent using Terminator.
-
-CORE RULE:
-Every UI action must follow this cycle:
-1. Inspect the relevant window.
-2. Identify the exact accessible control.
-3. Perform exactly one action.
-4. Inspect the resulting UI.
-5. Review the returned diff and controls.
-6. Decide the next action based on the new state.
-
-Never perform a sequence of clicks based on assumptions.
-The clickElement and typeText tools already inspect before and after
-their actions. Read their results before choosing the next action.
-
-SAVE WORKFLOW:
-1. Inspect the main Notepad window.
-2. Click File using its exact accessible role and name.
-3. Review the returned diff and inspect the menu.
-4. Click Save As using the exact role and name found in the menu.
-5. Review the returned diff.
-6. Inspect the Save As dialog using windowTitle "Save As".
-7. Find the filename field from that inspection.
-8. Use typeText on that exact field to enter:
-   Vangrex-AI-Agent-Output.txt
-9. Review the returned diff and inspect the dialog again.
-10. Click the inspected Save button.
-11. Inspect the resulting main window.
-12. If an overwrite confirmation appears, inspect it first.
-    Do not overwrite an existing file without explicit authorization.
-13. If any step fails, stop and report the actual result.
-14. Always use the UI to perform actions.
-
-Do not claim a file was saved merely because the Save button was clicked.
-Report only what the tool results establish.
-Do not repeatedly click a control if the UI did not change.
-`,
-
-    prompt: `
-Inspect Notepad and save the current document as
-Vangrex-AI-Agent-Output-{any_id}.txt.
-
-Inspect and review the diff after every action.
-Do not type new document content.
-Do not overwrite an existing file.
-Report whether the save was confirmed by the resulting UI.
-`,
-
-    tools: {
-      inspectUI: inspectUITool,
-      clickElement: clickElementTool,
-      typeText: typeTextTool,
-    },
-
-    stopWhen: stepCountIs(15),
+  const partialMatches = candidates.filter((element) => {
+    const name = normalizeText(element.name);
+    return name && (name.includes(requested) || requested.includes(name));
   });
 
-  console.log("\n========== AGENT RESPONSE ==========\n");
-  console.log(result.text);
+  if (partialMatches.length === 1) return partialMatches[0];
 
-  // console.log("\n========== TOOL CALLS ==========\n");
-  // console.dir(result.steps, { depth: 4 });
+  if (partialMatches.length > 1) {
+    console.log(
+      `[Click] Ambiguous element "${requestedName}":`,
+      partialMatches.map(({ name, role, bounds }) => ({
+        name,
+        role,
+        bounds,
+      })),
+    );
+  }
+
+  return undefined;
 }
 
-main().catch((error: unknown) => {
-  console.error("Agent failed:", error);
-  process.exitCode = 1;
-});
+// ============================================================
+// TEXT-BASED TREE DIFF
+// ============================================================
+
+// Produces concrete added/removed tree lines in addition to the
+// structured snapshot diff. The full tree remains private in memory.
+function getTreeLineDiff(oldTree: string, newTree: string): string {
+  const oldLines = oldTree
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const newLines = newTree
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const oldSet = new Set(oldLines);
+  const newSet = new Set(newLines);
+
+  const removed = oldLines.filter((line) => !newSet.has(line));
+  const added = newLines.filter((line) => !oldSet.has(line));
+
+  if (removed.length === 0 && added.length === 0) {
+    return "No textual tree changes detected.";
+  }
+
+  const limitedRemoved = removed.slice(0, MAX_DIFF_LINES);
+  const limitedAdded = added.slice(0, MAX_DIFF_LINES);
+
+  const sections: string[] = [];
+
+  if (added.length > 0) {
+    sections.push(
+      `ADDED OR CHANGED LINES (${added.length}):\n` +
+        limitedAdded.map((line) => `+ ${line}`).join("\n"),
+    );
+  }
+
+  if (removed.length > 0) {
+    sections.push(
+      `REMOVED OR CHANGED LINES (${removed.length}):\n` +
+        limitedRemoved.map((line) => `- ${line}`).join("\n"),
+    );
+  }
+
+  const omitted =
+    Math.max(0, added.length - limitedAdded.length) +
+    Math.max(0, removed.length - limitedRemoved.length);
+
+  if (omitted > 0) {
+    sections.push(`${omitted} additional changed lines omitted.`);
+  }
+
+  return sections.join("\n\n");
+}
+
+// ============================================================
+// INSPECT UI
+// ============================================================
+
+async function inspectCurrentApplication(
+  reason: string,
+  forceRefresh = false,
+): Promise<InspectionResult> {
+  if (treeIsCurrent && !forceRefresh && latestFormattedTree) {
+    console.log("[Inspect] UI has not been invalidated; using cached state.");
+
+    return {
+      success: true,
+      changes: "No new tree read was needed; the cached UI state is current.",
+      actionableElements: formatActionableElements(
+        detectActionableElements(latestFormattedTree),
+      ),
+    };
+  }
+
+  if (totalInspections >= MAX_TOTAL_INSPECTIONS) {
+    return {
+      success: false,
+      error: `Inspection budget exhausted (${MAX_TOTAL_INSPECTIONS}).`,
+    };
+  }
+
+  if (consecutiveInspections >= MAX_CONSECUTIVE_INSPECTIONS) {
+    return {
+      success: false,
+      error:
+        `Inspection limit reached (${MAX_CONSECUTIVE_INSPECTIONS} consecutive reads). ` +
+        "Choose an action using the latest available UI information.",
+    };
+  }
+
+  totalInspections++;
+  consecutiveInspections++;
+
+  console.log(`\n[Inspect] ${reason}`);
+  console.log(
+    `[Inspect] Read ${totalInspections}/${MAX_TOTAL_INSPECTIONS}; ` +
+      `consecutive ${consecutiveInspections}/${MAX_CONSECUTIVE_INSPECTIONS}`,
+  );
+
+  try {
+    const application = await desktop.getCurrentApplication();
+    const processName = await application.processName();
+
+    console.log("[Inspect] Current process:", processName);
+
+    if (!processName) {
+      return {
+        success: false,
+        error: "Could not determine the focused application's process.",
+      };
+    }
+
+    const result = await desktop.getWindowTreeResult(
+      processName,
+      undefined,
+      TREE_OPTIONS,
+    );
+
+    const formattedTree =
+      typeof result.formatted === "string" ? result.formatted : "";
+
+    console.log("[Inspect Debug] Formatted type:", typeof result.formatted);
+    console.log("[Inspect Debug] Formatted length:", formattedTree.length);
+
+    if (!formattedTree.trim()) {
+      treeIsCurrent = false;
+
+      return {
+        success: false,
+        error: "The UI tree returned no formatted text.",
+      };
+    }
+
+    // Capture the old state BEFORE replacing it.
+    const oldTree = latestFormattedTree;
+    const oldSnapshot = latestSnapshot;
+
+    // Build the new state.
+    const newSnapshot = createSnapshot(formattedTree);
+
+    let changeSummary: string;
+    let lineDiff: string;
+
+    if (oldSnapshot && oldTree) {
+      const snapshotDiff = diffSnapshots(oldSnapshot, newSnapshot);
+
+      changeSummary = summarizeChanges(snapshotDiff);
+      lineDiff = getTreeLineDiff(oldTree, formattedTree);
+
+      console.log("[Inspect] Compared new snapshot with previous snapshot.");
+    } else {
+      changeSummary = "Initial snapshot: no previous UI state to compare.";
+      lineDiff = "Initial inspection; the complete tree is provided once.";
+
+      console.log("[Inspect] Captured initial snapshot.");
+    }
+
+    // Save the latest state for future comparisons and click lookups.
+    latestSnapshot = newSnapshot;
+    latestFormattedTree = formattedTree;
+    treeIsCurrent = true;
+
+    const actionableElements = formatActionableElements(
+      detectActionableElements(formattedTree),
+    );
+
+    console.log("[Inspect] Tree captured successfully.");
+
+    // Only the first inspection returns the complete tree.
+    if (!oldSnapshot || !oldTree) {
+      return {
+        success: true,
+        initialTree: formattedTree,
+        actionableElements,
+        changes: changeSummary,
+      };
+    }
+
+    // Subsequent inspections return a diff and current actionable elements.
+    return {
+      success: true,
+      changes: `${changeSummary}\n\n${lineDiff}`,
+      actionableElements,
+    };
+  } catch (error) {
+    treeIsCurrent = false;
+
+    const message = error instanceof Error ? error.message : String(error);
+
+    console.error("[Inspect] Failed:", message);
+
+    return {
+      success: false,
+      error: message,
+    };
+  }
+}
+
+// ============================================================
+// CLICK ELEMENT — MOUSE ONLY
+// ============================================================
+
+async function clickElement(
+  elementName: string,
+): Promise<Record<string, unknown>> {
+  if (!elementName.trim()) {
+    return {
+      success: false,
+      error: "Provide the accessible name of the element to click.",
+    };
+  }
+
+  if (!treeIsCurrent || !latestFormattedTree) {
+    const inspection = await inspectCurrentApplication(
+      "Refresh UI before clicking",
+    );
+
+    if (!inspection.success) return inspection;
+  }
+
+  const element = findElement(elementName);
+
+  if (!element) {
+    return {
+      success: false,
+      error:
+        `No unique element named "${elementName}" with usable bounds ` +
+        "was found in the latest UI tree. Inspect the latest changes and " +
+        "actionable elements, then select an exact accessible name.",
+      actionableElements: latestFormattedTree
+        ? formatActionableElements(
+            detectActionableElements(latestFormattedTree),
+          )
+        : undefined,
+    };
+  }
+
+  console.log(`[Click] "${element.name}" (${element.role})`, element.bounds);
+
+  try {
+    const { x, y, width, height } = element.bounds;
+
+    await desktop.clickAtBounds(x, y, width, height);
+
+    successfulActions++;
+    resetInspectionGuard();
+    invalidateTree();
+
+    console.log("[Click] Click call completed.");
+
+    return {
+      success: true,
+      clickedElement: element.name,
+      role: element.role,
+      verified: false,
+      message: "Click completed. Inspect the UI to see what changed.",
+    };
+  } catch (error) {
+    return {
+      success: false,
+      element: element.name,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+// ============================================================
+// TYPE TEXT — NO KEYBOARD SHORTCUTS
+// ============================================================
+
+async function typeText(textToType: string): Promise<Record<string, unknown>> {
+  if (!textToType.length) {
+    return { success: false, error: "No text was supplied." };
+  }
+
+  try {
+    const application = await desktop.getCurrentApplication();
+
+    // The intended input must already be focused by a mouse click.
+    await application.typeText(textToType, {
+      clearBeforeTyping: true,
+      includeWindowScreenshot: false,
+    });
+
+    successfulActions++;
+    resetInspectionGuard();
+    invalidateTree();
+
+    console.log(`[Type] Typed ${textToType.length} character(s).`);
+
+    return {
+      success: true,
+      characterCount: textToType.length,
+      verified: false,
+      message: "Text entry completed. Inspect the UI to see what changed.",
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+// ============================================================
+// AI TOOLS
+// ============================================================
+
+const terminatorTools = {
+  inspectUI: tool({
+    description:
+      "Refresh and inspect the current application's UI. The initial " +
+      "inspection returns the full tree. Later inspections return only " +
+      "the UI diff, added/removed tree lines, and current actionable " +
+      "elements. Use those changes to decide the next action.",
+
+    inputSchema: z.object({
+      reason: z.string(),
+    }),
+
+    execute: async ({ reason }) => {
+      return await inspectCurrentApplication(reason);
+    },
+  }),
+
+  clickElement: tool({
+    description:
+      "Click an element by its exact accessible name from the latest UI " +
+      "information. Uses mouse clicks only. Never invent element names.",
+
+    inputSchema: z.object({
+      elementName: z.string(),
+    }),
+
+    execute: async ({ elementName }) => {
+      return await clickElement(elementName);
+    },
+  }),
+
+  typeText: tool({
+    description:
+      "Type literal text into the currently focused input. Click the " +
+      "target field first. This tool does not perform keyboard shortcuts.",
+
+    inputSchema: z.object({
+      text: z.string(),
+    }),
+
+    execute: async ({ text }) => {
+      return await typeText(text);
+    },
+  }),
+};
+
+// ============================================================
+// SYSTEM PROMPT
+// ============================================================
+
+const SYSTEM_PROMPT = `
+You are a desktop UI automation agent.
+
+INTERACTION RULES:
+- Use mouse clicks and literal text entry only.
+- Never press keyboard keys or use keyboard shortcuts.
+- Never invent element names or coordinates.
+- The click tool uses the latest UI tree held internally.
+
+DIFF-DRIVEN INSPECTION:
+- The initial prompt contains the complete UI tree.
+- After an action, inspect the updated UI.
+- Subsequent inspections provide a diff, changed tree lines, and current
+  actionable elements instead of the full tree.
+- Compare these changes with the previous UI state to understand what
+  happened after your action.
+- Use the actionable elements to choose the next exact element name.
+- Do not request repeated inspections of an unchanged UI.
+- If inspection fails, use its error and do not retry blindly.
+- Do not assume a click succeeded merely because the tool call completed.
+
+TASK COMPLETION:
+- Verify important actions by inspecting the resulting UI.
+- Do not claim an extension was installed unless the UI confirms it.
+- If a required operation cannot be completed using clicks and text entry,
+  explain the limitation honestly.
+`;
+
+// ============================================================
+// MAIN
+// ============================================================
+
+async function main(): Promise<void> {
+  const task = process.argv.slice(2).join(" ").trim();
+
+  if (!task) {
+    console.error('Usage: bun run ./test.ts "Describe the desktop task"');
+    process.exitCode = 1;
+    return;
+  }
+
+  if (!process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
+    console.error("Missing GOOGLE_GENERATIVE_AI_API_KEY in .env.");
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log("Starting desktop agent...");
+  console.log("Task:", task);
+  console.log("Model:", MODEL);
+  console.log("Interaction methods: mouse clicks + text entry only.");
+  console.log("UI context: initial tree, then diffs + actionable elements.");
+
+  const initialInspection = await inspectCurrentApplication(
+    "Initial inspection before executing the task",
+    true,
+  );
+
+  if (!initialInspection.success || !initialInspection.initialTree) {
+    console.error(
+      "\nCould not inspect the initial application:",
+      initialInspection.error,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  const initialContext = `
+INITIAL UI TREE:
+${initialInspection.initialTree}
+
+ACTIONABLE ELEMENTS:
+${initialInspection.actionableElements ?? "None identified."}
+
+TASK:
+${task}
+
+The initial tree is your baseline. After each action, inspect the UI and
+reason from the returned changes and actionable elements. Do not expect
+the full tree to be repeated.
+`;
+
+  try {
+    const result = await generateText({
+      model: google(MODEL),
+      system: SYSTEM_PROMPT,
+      prompt: initialContext,
+      tools: terminatorTools,
+      stopWhen: stepCountIs(MAX_STEPS),
+    });
+
+    console.log("\n================ AGENT RESULT ================\n");
+    console.log(result.text || "(No final text returned.)");
+    console.log("\n================================================");
+
+    console.log("\nExecution summary:");
+    console.log(`- Total tree reads: ${totalInspections}`);
+    console.log(`- Successful action calls: ${successfulActions}`);
+    console.log(`- Consecutive inspections: ${consecutiveInspections}`);
+    console.log("- Keyboard interaction: disabled");
+    console.log("- Follow-up UI context: diffs + actionable elements");
+  } catch (error) {
+    console.error("\nAgent execution failed:");
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  }
+}
+
+await main();
