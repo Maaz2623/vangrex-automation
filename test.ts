@@ -1,4 +1,3 @@
-
 import "dotenv/config";
 
 import { Desktop } from "@mediar-ai/terminator";
@@ -251,9 +250,7 @@ function getTreeLineDiff(oldTree: string, newTree: string): string {
 // DYNAMIC TREE RETRIEVAL
 // ============================================================
 
-async function getDynamicWindowTree(
-  processName: string,
-): Promise<string> {
+async function getDynamicWindowTree(processName: string): Promise<string> {
   const errors: string[] = [];
 
   // Try the primary API first.
@@ -264,17 +261,13 @@ async function getDynamicWindowTree(
       TREE_OPTIONS,
     );
 
-    if (
-      typeof result.formatted === "string" &&
-      result.formatted.trim()
-    ) {
+    if (typeof result.formatted === "string" && result.formatted.trim()) {
       return result.formatted;
     }
 
     errors.push("getWindowTreeResult returned no formatted text.");
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : String(error);
+    const message = error instanceof Error ? error.message : String(error);
 
     errors.push(`getWindowTreeResult: ${message}`);
   }
@@ -287,17 +280,13 @@ async function getDynamicWindowTree(
       TREE_OPTIONS,
     );
 
-    if (
-      typeof result.formatted === "string" &&
-      result.formatted.trim()
-    ) {
+    if (typeof result.formatted === "string" && result.formatted.trim()) {
       return result.formatted;
     }
 
     errors.push("getWindowTreeResultAsync returned no formatted text.");
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : String(error);
+    const message = error instanceof Error ? error.message : String(error);
 
     errors.push(`getWindowTreeResultAsync: ${message}`);
   }
@@ -338,8 +327,7 @@ async function inspectCurrentApplication(
   if (consecutiveInspections >= MAX_CONSECUTIVE_INSPECTIONS) {
     return {
       success: false,
-      error:
-        `Inspection limit reached (${MAX_CONSECUTIVE_INSPECTIONS} consecutive reads).`,
+      error: `Inspection limit reached (${MAX_CONSECUTIVE_INSPECTIONS} consecutive reads).`,
     };
   }
 
@@ -379,9 +367,7 @@ async function inspectCurrentApplication(
     let lineDiff: string;
 
     if (oldTree && oldSnapshot) {
-      changeSummary = summarizeChanges(
-        diffSnapshots(oldSnapshot, newSnapshot),
-      );
+      changeSummary = summarizeChanges(diffSnapshots(oldSnapshot, newSnapshot));
 
       lineDiff = getTreeLineDiff(oldTree, formattedTree);
 
@@ -420,8 +406,7 @@ async function inspectCurrentApplication(
   } catch (error) {
     treeIsCurrent = false;
 
-    const message =
-      error instanceof Error ? error.message : String(error);
+    const message = error instanceof Error ? error.message : String(error);
 
     console.error("[Inspect] Failed:", message);
 
@@ -470,10 +455,7 @@ async function clickElement(
     };
   }
 
-  console.log(
-    `[Click] "${element.name}" (${element.role})`,
-    element.bounds,
-  );
+  console.log(`[Click] "${element.name}" (${element.role})`, element.bounds);
 
   try {
     const { x, y, width, height } = element.bounds;
@@ -503,9 +485,7 @@ async function clickElement(
 // TYPE TEXT — LITERAL TEXT ONLY
 // ============================================================
 
-async function typeText(
-  textToType: string,
-): Promise<Record<string, unknown>> {
+async function typeText(textToType: string): Promise<Record<string, unknown>> {
   if (!textToType.length) {
     return {
       success: false,
@@ -621,8 +601,12 @@ TASK:
 // ============================================================
 // MAIN
 // ============================================================
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 async function main(): Promise<void> {
+  sleep(5000);
+
   const task = process.argv.slice(2).join(" ").trim();
 
   if (!task) {
